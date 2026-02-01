@@ -1,8 +1,8 @@
 [package]
-name = "sleitnick/loader"
+name = "stackyzdev/loader"
 description = "Requires all modules within a given instance"
-version = "2.0.0"
+version = "2.0.1"
 license = "MIT"
-authors = ["Stephen Leitnick"]
+authors = ["Stephen Leitnick", "StackyzDev"]
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
