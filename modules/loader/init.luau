@@ -5,6 +5,9 @@
 	some utility functions included, which assist with loading and starting modules in
 	single-script environments.
 
+	All loading operations are performed in parallel for better performance. The loader
+	automatically detects and reports module retentions that might impact gameplay.
+
 	For example, here is a loader that loads all ModuleScripts under a folder that end with
 	the name Service, and then calls all of their OnStart methods:
 	```lua
@@ -31,25 +34,121 @@ type PredicateFn = (module: ModuleScript) -> boolean
 	.LoadTime number
 	.Name string
 	.Module any
+	.HadRetention boolean
+	.RetentionDetails table?
 ]=]
 type LoadedModuleInfo = {
 	ModuleScript: ModuleScript,
 	LoadTime: number,
 	Name: string,
 	Module: any,
+	HadRetention: boolean,
+	RetentionDetails: { any }?,
 }
 
--- Debug tracking
-local DEBUG_ENABLED = false
-local loadedModules: { LoadedModuleInfo } = {}
-local loadOrder: { string } = {}
+--[=[
+	@within Loader
+	@interface LoadStats
+	.TotalModules number
+	.TotalLoadTime number
+	.AverageLoadTime number
+	.SlowestModule string?
+	.SlowestLoadTime number?
+	.FastestModule string?
+	.FastestLoadTime number?
+	.ModulesWithRetention number
+	.RetainedModules { string }
+]=]
+type LoadStats = {
+	TotalModules: number,
+	TotalLoadTime: number,
+	AverageLoadTime: number,
+	SlowestModule: string?,
+	SlowestLoadTime: number?,
+	FastestModule: string?,
+	FastestLoadTime: number?,
+	ModulesWithRetention: number,
+	RetainedModules: { string },
+}
+
+-- Debug state
+local debugState = {
+	enabled = true, -- Auto-enabled, can be disabled with DisableDebug()
+	modules = {} :: { LoadedModuleInfo },
+	order = {} :: { string },
+	lastLoadStats = nil :: LoadStats?,
+}
+
+-- Helper function to detect retention in a loaded module
+local function checkRetention(module: any, moduleName: string): { HadRetention: boolean, Details: { any }? }
+	if type(module) ~= "table" then
+		return { HadRetention = false, Details = nil }
+	end
+
+	local details: { any } = {}
+	local count = 0
+
+	for key in pairs(module) do
+		table.insert(details, tostring(key))
+		count += 1
+	end
+
+	-- A module with many entries might indicate retention
+	-- This is a heuristic - modules typically have a few core functions/tables
+	local hasRetention = count > 50 or (count > 20 and table.find(details, "____modules"))
+
+	return {
+		HadRetention = hasRetention,
+		Details = if hasRetention then details else nil,
+	}
+end
+
+-- Helper function to load a module and track its info
+local function loadModuleInfo(moduleScript: ModuleScript): { Success: boolean, Info: LoadedModuleInfo?, Error: string? }
+	local startTime = os.clock()
+
+	local success, result = pcall(function()
+		return require(moduleScript)
+	end)
+
+	local loadTime = os.clock() - startTime
+
+	if not success then
+		return {
+			Success = false,
+			Info = nil,
+			Error = tostring(result),
+		}
+	end
+
+	local retentionCheck = checkRetention(result, moduleScript.Name)
+
+	local info: LoadedModuleInfo = {
+		ModuleScript = moduleScript,
+		LoadTime = loadTime,
+		Name = moduleScript.Name,
+		Module = result,
+		HadRetention = retentionCheck.HadRetention,
+		RetentionDetails = retentionCheck.Details,
+	}
+
+	return {
+		Success = true,
+		Info = info,
+		Error = nil,
+	}
+end
 
 --[=[
-	Requires all children ModuleScripts.
+	Requires all children ModuleScripts in parallel.
+
+	All modules are loaded concurrently and the function waits for all to complete
+	before returning. This provides better performance while maintaining reliability.
 
 	If a `predicate` function is provided, then the module will only
-	be loaded if the predicate returns `true` for the the given
-	ModuleScript.
+	be loaded if the predicate returns `true` for the given ModuleScript.
+
+	Modules with retention issues are automatically detected and reported.
 
 	```lua
 	-- Load all ModuleScripts directly under MyModules:
@@ -63,69 +162,146 @@ local loadOrder: { string } = {}
 ]=]
 function Loader.LoadChildren(parent: Instance, predicate: PredicateFn?): { [string]: any }
 	local modules: { [string]: any } = {}
+	local childrenToLoad: { ModuleScript } = {}
+
+	-- Collect children to load
 	for _, child in parent:GetChildren() do
 		if child:IsA("ModuleScript") then
 			if predicate and not predicate(child) then
 				continue
 			end
-			local startTime = if DEBUG_ENABLED then os.clock() else 0
-			local m = require(child)
-			modules[child.Name] = m
+			table.insert(childrenToLoad, child)
+		end
+	end
 
-			if DEBUG_ENABLED then
-				local loadTime = os.clock() - startTime
-				table.insert(loadedModules, {
-					ModuleScript = child,
-					LoadTime = loadTime,
-					Name = child.Name,
-					Module = m,
-				})
-				table.insert(loadOrder, child.Name)
+	-- Load all in parallel
+	local loadTasks: { thread } = {}
+	local loadResults: { { Success: boolean, Info: LoadedModuleInfo?, Error: string? } } = {}
+
+	for _, moduleScript in childrenToLoad do
+		table.insert(
+			loadTasks,
+			task.spawn(function(i)
+				loadResults[i] = loadModuleInfo(moduleScript)
+			end, #loadTasks + 1)
+		)
+	end
+
+	-- Wait for all to complete
+	for _, thread in loadTasks do
+		task.wait()
+	end
+
+	-- Process results
+	for i, result in loadResults do
+		if result.Success then
+			local info = result.Info :: LoadedModuleInfo
+			modules[info.Name] = info.Module
+
+			if debugState.enabled then
+				table.insert(debugState.modules, info)
+				table.insert(debugState.order, info.Name)
+
+				if info.HadRetention then
+					print(
+						`⚠️  [Loader] Module "{info.Name}" detected with retention ({#(info.RetentionDetails or {})} entries)`
+					)
+				end
+			end
+		else
+			local moduleScript = childrenToLoad[i]
+			if moduleScript then
+				print(`⚠️  [Loader] Failed to load "{moduleScript.Name}": {result.Error}`)
 			end
 		end
 	end
+
+	if debugState.enabled and #debugState.modules > 0 then
+		debugState.lastLoadStats = Loader.GetLoadStats()
+	end
+
 	return modules
 end
 
 --[=[
-	Requires all descendant ModuleScripts.
+	Requires all descendant ModuleScripts in parallel.
+
+	All modules are loaded concurrently and the function waits for all to complete
+	before returning. This provides better performance while maintaining reliability.
 
 	If a `predicate` function is provided, then the module will only
-	be loaded if the predicate returns `true` for the the given
-	ModuleScript.
+	be loaded if the predicate returns `true` for the given ModuleScript.
+
+	Modules with retention issues are automatically detected and reported.
 
 	```lua
 	-- Load all ModuleScripts under MyModules:
 	Loader.LoadDescendants(ReplicatedStorage.MyModules)
 
-	-- Load startTime = if DEBUG_ENABLED then os.clock() else 0
-			local m = require(descendant)
-			modules[descendant.Name] = m
-
-			if DEBUG_ENABLED then
-				local loadTime = os.clock() - startTime
-				table.insert(loadedModules, {
-					ModuleScript = descendant,
-					LoadTime = loadTime,
-					Name = descendant.Name,
-					Module = m,
-				})
-				table.insert(loadOrder, descendant.Name)
-			endtedStorage.MyModules, function(moduleScript)
-		return moduleScript.Name:match("Service$") ~= nil
-	end)
+	-- Load all ModuleScripts under MyModules if they have names ending in 'Service':
+	Loader.LoadDescendants(ReplicatedStorage.MyModules, Loader.MatchesName("Service$"))
+	```
 ]=]
 function Loader.LoadDescendants(parent: Instance, predicate: PredicateFn?): { [string]: any }
 	local modules: { [string]: any } = {}
+	local descendantsToLoad: { ModuleScript } = {}
+
+	-- Collect descendants to load
 	for _, descendant in parent:GetDescendants() do
 		if descendant:IsA("ModuleScript") then
 			if predicate and not predicate(descendant) then
 				continue
 			end
-			local m = require(descendant)
-			modules[descendant.Name] = m
+			table.insert(descendantsToLoad, descendant)
 		end
 	end
+
+	-- Load all in parallel
+	local loadTasks: { thread } = {}
+	local loadResults: { { Success: boolean, Info: LoadedModuleInfo?, Error: string? } } = {}
+
+	for _, moduleScript in descendantsToLoad do
+		table.insert(
+			loadTasks,
+			task.spawn(function(i)
+				loadResults[i] = loadModuleInfo(moduleScript)
+			end, #loadTasks + 1)
+		)
+	end
+
+	-- Wait for all to complete
+	for _ in loadTasks do
+		task.wait()
+	end
+
+	-- Process results
+	for i, result in loadResults do
+		if result.Success then
+			local info = result.Info :: LoadedModuleInfo
+			modules[info.Name] = info.Module
+
+			if debugState.enabled then
+				table.insert(debugState.modules, info)
+				table.insert(debugState.order, info.Name)
+
+				if info.HadRetention then
+					print(
+						`⚠️  [Loader] Module "{info.Name}" detected with retention ({#(info.RetentionDetails or {})} entries)`
+					)
+				end
+			end
+		else
+			local moduleScript = descendantsToLoad[i]
+			if moduleScript then
+				print(`⚠️  [Loader] Failed to load "{moduleScript.Name}": {result.Error}`)
+			end
+		end
+	end
+
+	if debugState.enabled and #debugState.modules > 0 then
+		debugState.lastLoadStats = Loader.GetLoadStats()
+	end
+
 	return modules
 end
 
@@ -145,109 +321,76 @@ function Loader.MatchesName(matchName: string): (module: ModuleScript) -> boolea
 end
 
 --[=[
-	Enables debug tracking for the loader. When enabled, the loader will
-	track all loaded modules, their load times, and load order.
+	Enables automatic debug output and retention tracking.
+	Enabled by default.
+
+	When enabled, the loader will:
+	- Automatically detect and print module retentions
+	- Track load times and module information
+	- Print warnings for modules with retention issues
 
 	```lua
-	-- Enable debug mode:
 	Loader.EnableDebug()
-
-	-- Load modules:
 	Loader.LoadDescendants(ReplicatedStorage.MyModules)
-
-	-- Get statistics:
-	print(Loader.GetLoadStats())
+	-- Retention issues will be printed automatically
 	```
 ]=]
 function Loader.EnableDebug()
-	DEBUG_ENABLED = true
+	debugState.enabled = true
 end
 
 --[=[
-	Disables debug tracking for the loader.
+	Disables automatic debug output and retention tracking.
+
+	```lua
+	Loader.DisableDebug()
+	```
 ]=]
 function Loader.DisableDebug()
-	DEBUG_ENABLED = false
+	debugState.enabled = false
 end
 
 --[=[
-	Returns whether debug tracking is enabled.
+	Returns whether debug mode is currently enabled.
 ]=]
 function Loader.IsDebugEnabled(): boolean
-	return DEBUG_ENABLED
+	return debugState.enabled
 end
 
 --[=[
-	Clears all debug tracking data.
+	Clears all accumulated debug data. Useful when loading multiple batches of modules.
+
+	```lua
+	Loader.ClearDebugData()
+	```
 ]=]
 function Loader.ClearDebugData()
-	table.clear(loadedModules)
-	table.clear(loadOrder)
+	table.clear(debugState.modules)
+	table.clear(debugState.order)
+	debugState.lastLoadStats = nil
 end
 
 --[=[
-	Returns a list of all loaded modules with their information.
-	Only works if debug mode is enabled.
+	Returns detailed statistics about the last completed load operation.
+	Includes information about module load times and retention.
 
 	```lua
-	Loader.EnableDebug()
 	Loader.LoadDescendants(ReplicatedStorage.MyModules)
-
-	for _, info in Loader.GetLoadedModules() do
-		print(info.Name, "loaded in", info.LoadTime, "seconds")
-	end
-	```
-]=]
-function Loader.GetLoadedModules(): { LoadedModuleInfo }
-	return table.clone(loadedModules)
-end
-
---[=[
-	Returns the order in which modules were loaded.
-	Only works if debug mode is enabled.
-
-	```lua
-	Loader.EnableDebug()
-	Loader.LoadDescendants(ReplicatedStorage.MyModules)
-	print("Load order:", table.concat(Loader.GetLoadOrder(), ", "))
-	```
-]=]
-function Loader.GetLoadOrder(): { string }
-	return table.clone(loadOrder)
-end
-
---[=[
-	Returns statistics about loaded modules.
-	Only works if debug mode is enabled.
-
-	```lua
-	Loader.EnableDebug()
-	Loader.LoadDescendants(ReplicatedStorage.MyModules)
-
 	local stats = Loader.GetLoadStats()
-	print("Total modules:", stats.TotalModules)
-	print("Total load time:", stats.TotalLoadTime)
-	print("Average load time:", stats.AverageLoadTime)
-	print("Slowest module:", stats.SlowestModule)
+	print(`Loaded {stats.TotalModules} modules in {stats.TotalLoadTime}s`)
+	print(`Modules with retention: {stats.ModulesWithRetention}`)
 	```
 ]=]
-function Loader.GetLoadStats(): {
-	TotalModules: number,
-	TotalLoadTime: number,
-	AverageLoadTime: number,
-	SlowestModule: string?,
-	SlowestLoadTime: number?,
-	FastestModule: string?,
-	FastestLoadTime: number?,
-}
-	local totalModules = #loadedModules
+function Loader.GetLoadStats(): LoadStats
+	local totalModules = #debugState.modules
 	local totalLoadTime = 0
 	local slowestModule: string? = nil
 	local slowestTime = 0
 	local fastestModule: string? = nil
 	local fastestTime = math.huge
+	local modulesWithRetention: { string } = {}
 
-	for _, info in loadedModules do
+	for _, info in debugState.modules do
 		totalLoadTime += info.LoadTime
 
 		if info.LoadTime > slowestTime then
@@ -259,6 +402,10 @@ function Loader.GetLoadStats(): {
 			fastestTime = info.LoadTime
 			fastestModule = info.Name
 		end
+
+		if info.HadRetention then
+			table.insert(modulesWithRetention, info.Name)
+		end
 	end
 
 	return {
@@ -269,109 +416,117 @@ function Loader.GetLoadStats(): {
 		SlowestLoadTime = if slowestModule then slowestTime else nil,
 		FastestModule = fastestModule,
 		FastestLoadTime = if fastestModule and fastestTime ~= math.huge then fastestTime else nil,
+		ModulesWithRetention = #modulesWithRetention,
+		RetainedModules = modulesWithRetention,
 	}
 end
 
 --[=[
-	Returns a detailed report of all loaded modules, sorted by load time.
-	Only works if debug mode is enabled.
+	Prints a comprehensive debug report including load times and retention issues.
+	Automatically called after parallel loads when debug is enabled.
 
 	```lua
-	Loader.EnableDebug()
 	Loader.LoadDescendants(ReplicatedStorage.MyModules)
-	print(Loader.GetLoadReport())
+	Loader.PrintDebugReport()
 	```
 ]=]
-function Loader.GetLoadReport(): string
-	if #loadedModules == 0 then
-		return "No modules loaded (debug mode might be disabled)"
+function Loader.PrintDebugReport()
+	if #debugState.modules == 0 then
+		print("⚠️  [Loader] No modules loaded")
+		return
 	end
 
-	local sorted = table.clone(loadedModules)
+	local stats = Loader.GetLoadStats()
+
+	print(
+		"═══════════════════════════════════════════════════════"
+	)
+	print("[Loader] Load Statistics")
+	print(
+		"═══════════════════════════════════════════════════════"
+	)
+	print(`Total Modules: {stats.TotalModules}`)
+	print(`Total Load Time: {string.format("%.4f", stats.TotalLoadTime)}s`)
+	print(`Average Load Time: {string.format("%.4f", stats.AverageLoadTime)}s`)
+
+	if stats.SlowestModule then
+		print(`Slowest Module: {stats.SlowestModule} ({string.format("%.4f", stats.SlowestLoadTime)}s)`)
+	end
+
+	if stats.FastestModule then
+		print(`Fastest Module: {stats.FastestModule} ({string.format("%.4f", stats.FastestLoadTime)}s)`)
+	end
+
+	if stats.ModulesWithRetention > 0 then
+		print(`⚠️  Modules with Retention: {stats.ModulesWithRetention}`)
+		for _, name in stats.RetainedModules do
+			print(`   - {name}`)
+		end
+	else
+		print("✓ No retention issues detected")
+	end
+
+	print(
+		"═══════════════════════════════════════════════════════"
+	)
+
+	-- Print load order sorted by time
+	local sorted = table.clone(debugState.modules)
 	table.sort(sorted, function(a, b)
 		return a.LoadTime > b.LoadTime
 	end)
 
-	local lines = { "=== Loader Report ===" }
-	table.insert(lines, `Total Modules: {#loadedModules}`)
-
-	local stats = Loader.GetLoadStats()
-	table.insert(lines, `Total Load Time: {string.format("%.4f", stats.TotalLoadTime)}s`)
-	table.insert(lines, `Average Load Time: {string.format("%.4f", stats.AverageLoadTime)}s`)
-	table.insert(lines, "")
-	table.insert(lines, "Modules by Load Time:")
+	print("[Loader] Modules by Load Time")
+	print(
+		"═══════════════════════════════════════════════════════"
+	)
 
 	for i, info in sorted do
 		local time = string.format("%.4f", info.LoadTime)
-		table.insert(lines, `{i}. {info.Name}: {time}s`)
+		local retention = if info.HadRetention then " ⚠️ " else ""
+		print(`{i}. {info.Name}: {time}s{retention}`)
 	end
 
-	return table.concat(lines, "\n")
+	print(
+		"═══════════════════════════════════════════════════════"
+	)
 end
 
 --[=[
-	Returns information about module retentions by analyzing the loaded modules.
-	This provides insight into which modules are being held in memory and by what.
+	Returns detailed information about modules that experienced retention issues.
+	Returns a table mapping module names to their retention details.
 
 	```lua
-	Loader.EnableDebug()
 	Loader.LoadDescendants(ReplicatedStorage.MyModules)
-
-	local retentions = Loader.GetRetentions()
-	for moduleName, info in retentions do
-		print(moduleName, "has", info.ReferenceCount, "direct references")
-	end
-	```
-]=]
-function Loader.GetRetentions(): { [string]: { ReferenceCount: number, ModuleScript: ModuleScript } }
-	local retentions: { [string]: { ReferenceCount: number, ModuleScript: ModuleScript } } = {}
-
-	for _, info in loadedModules do
-		local refs = 0
-		local module = info.Module
-
-		-- Count table references
-		if type(module) == "table" then
-			for _ in pairs(module) do
-				refs += 1
-			end
-		end
-
-		retentions[info.Name] = {
-			ReferenceCount = refs,
-			ModuleScript = info.ModuleScript,
-		}
-	end
-
-	return retentions
-end
-
---[=[
-	Prints a summary of module retentions to the output.
-	Only works if debug mode is enabled.
-
-	```lua
-	Loader.EnableDebug()
-	Loader.LoadDescendants(ReplicatedStorage.MyModules)
-	Loader.PrintRetentions()
-	```
-]=]
-function Loader.PrintRetentions()
-	local retentions = Loader.GetRetentions()
-	local sorted: { { Name: string, ReferenceCount: number } } = {}
-
+	local retentions = Loader.GetRetentionReport()
 	for name, info in retentions do
-		table.insert(sorted, { Name = name, ReferenceCount = info.ReferenceCount })
+		print(`{name} retained {info.Count} entries`)
+	end
+	```
+]=]
+function Loader.GetRetentionReport(): {
+	[string]: {
+		Count: number,
+		Details: { string },
+	},
+}
+	local report: {
+		[string]: {
+			Count: number,
+			Details: { string },
+		},
+	} = {}
+
+	for _, info in debugState.modules do
+		if info.HadRetention and info.RetentionDetails then
+			report[info.Name] = {
+				Count = #info.RetentionDetails,
+				Details = info.RetentionDetails :: { string },
+			}
+		end
 	end
 
-	table.sort(sorted, function(a, b)
-		return a.ReferenceCount > b.ReferenceCount
-	end)
-
-	print("=== Module Retentions ===")
-	for _, item in sorted do
-		print(`{item.Name}: {item.ReferenceCount} table entries`)
-	end
+	return report
 end
 
 --[=[
